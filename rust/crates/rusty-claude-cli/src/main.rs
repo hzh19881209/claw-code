@@ -12,9 +12,7 @@ use api::{
     ToolResultContentBlock,
 };
 
-use commands::{
-    handle_slash_command, render_slash_command_help, resume_supported_slash_commands, SlashCommand,
-};
+use commands::{render_slash_command_help, resume_supported_slash_commands, SlashCommand};
 use compat_harness::{extract_manifest, UpstreamPaths};
 use render::{Spinner, TerminalRenderer};
 use runtime::{
@@ -258,6 +256,8 @@ struct StatusContext {
     loaded_config_files: usize,
     discovered_config_files: usize,
     memory_file_count: usize,
+    project_root: Option<PathBuf>,
+    git_branch: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -291,6 +291,122 @@ fn format_model_switch_report(previous: &str, next: &str, message_count: usize) 
     )
 }
 
+fn format_permissions_report(mode: &str) -> String {
+    format!(
+        "Permissions
+  Current mode     {mode}
+
+Available modes
+  read-only        Allow read/search tools only
+  workspace-write  Allow editing within the workspace
+  danger-full-access Allow unrestricted tool access"
+    )
+}
+
+fn format_permissions_switch_report(previous: &str, next: &str) -> String {
+    format!(
+        "Permissions updated
+  Previous         {previous}
+  Current          {next}"
+    )
+}
+
+fn format_cost_report(usage: TokenUsage) -> String {
+    format!(
+        "Cost
+  Input tokens     {}
+  Output tokens    {}
+  Cache create     {}
+  Cache read       {}
+  Total tokens     {}",
+        usage.input_tokens,
+        usage.output_tokens,
+        usage.cache_creation_input_tokens,
+        usage.cache_read_input_tokens,
+        usage.total_tokens(),
+    )
+}
+
+fn format_resume_report(session_path: &str, message_count: usize, turns: u32) -> String {
+    format!(
+        "Session resumed
+  Session file     {session_path}
+  Messages         {message_count}
+  Turns            {turns}"
+    )
+}
+
+fn format_init_report(path: &Path, created: bool) -> String {
+    if created {
+        format!(
+            "Init
+  CLAUDE.md        {}
+  Result           created
+  Next step        Review and tailor the generated guidance",
+            path.display()
+        )
+    } else {
+        format!(
+            "Init
+  CLAUDE.md        {}
+  Result           skipped (already exists)
+  Next step        Edit the existing file intentionally if workflows changed",
+            path.display()
+        )
+    }
+}
+
+fn format_compact_report(removed: usize, resulting_messages: usize, skipped: bool) -> String {
+    if skipped {
+        format!(
+            "Compact
+  Result           skipped
+  Reason           session below compaction threshold
+  Messages kept    {resulting_messages}"
+        )
+    } else {
+        format!(
+            "Compact
+  Result           compacted
+  Messages removed {removed}
+  Messages kept    {resulting_messages}"
+        )
+    }
+}
+
+fn parse_git_status_metadata(status: Option<&str>) -> (Option<PathBuf>, Option<String>) {
+    let Some(status) = status else {
+        return (None, None);
+    };
+    let branch = status.lines().next().and_then(|line| {
+        line.strip_prefix("## ")
+            .map(|line| {
+                line.split(['.', ' '])
+                    .next()
+                    .unwrap_or_default()
+                    .to_string()
+            })
+            .filter(|value| !value.is_empty())
+    });
+    let project_root = find_git_root().ok();
+    (project_root, branch)
+}
+
+fn find_git_root() -> Result<PathBuf, Box<dyn std::error::Error>> {
+    let output = std::process::Command::new("git")
+        .args(["rev-parse", "--show-toplevel"])
+        .current_dir(env::current_dir()?)
+        .output()?;
+    if !output.status.success() {
+        return Err("not a git repository".into());
+    }
+    let path = String::from_utf8(output.stdout)?.trim().to_string();
+    if path.is_empty() {
+        return Err("empty git root".into());
+    }
+    Ok(PathBuf::from(path))
+}
+
 fn run_resume_command(
     session_path: &Path,
     session: &Session,
@@ -302,23 +418,20 @@ fn run_resume_command(
             message: Some(render_repl_help()),
         }),
         SlashCommand::Compact => {
-            let Some(result) = handle_slash_command(
-                "/compact",
+            let result = runtime::compact_session(
                 session,
                 CompactionConfig {
                     max_estimated_tokens: 0,
                     ..CompactionConfig::default()
                 },
-            ) else {
-                return Ok(ResumeCommandOutcome {
-                    session: session.clone(),
-                    message: None,
-                });
-            };
-            result.session.save_to_path(session_path)?;
+            );
+            let removed = result.removed_message_count;
+            let kept = result.compacted_session.messages.len();
+            let skipped = removed == 0;
+            result.compacted_session.save_to_path(session_path)?;
             Ok(ResumeCommandOutcome {
-                session: result.session,
-                message: Some(result.message),
+                session: result.compacted_session,
+                message: Some(format_compact_report(removed, kept, skipped)),
             })
         }
         SlashCommand::Clear { confirm } => {
@@ -363,19 +476,12 @@ fn run_resume_command(
             let usage = UsageTracker::from_session(session).cumulative_usage();
             Ok(ResumeCommandOutcome {
                 session: session.clone(),
-                message: Some(format!(
-                    "cost: input_tokens={} output_tokens={} cache_creation_tokens={} cache_read_tokens={} total_tokens={}",
-                    usage.input_tokens,
-                    usage.output_tokens,
-                    usage.cache_creation_input_tokens,
-                    usage.cache_read_input_tokens,
-                    usage.total_tokens(),
-                )),
+                message: Some(format_cost_report(usage)),
             })
         }
-        SlashCommand::Config => Ok(ResumeCommandOutcome {
+        SlashCommand::Config { section } => Ok(ResumeCommandOutcome {
             session: session.clone(),
-            message: Some(render_config_report()?),
+            message: Some(render_config_report(section.as_deref())?),
         }),
         SlashCommand::Memory => Ok(ResumeCommandOutcome {
             session: session.clone(),
@@ -481,7 +587,7 @@ impl LiveCli {
             SlashCommand::Clear { confirm } => self.clear_session(confirm)?,
             SlashCommand::Cost => self.print_cost(),
             SlashCommand::Resume { session_path } => self.resume_session(session_path)?,
-            SlashCommand::Config => Self::print_config()?,
+            SlashCommand::Config { section } => Self::print_config(section.as_deref())?,
             SlashCommand::Memory => Self::print_memory()?,
             SlashCommand::Init => Self::run_init()?,
             SlashCommand::Unknown(name) => eprintln!("unknown slash command: /{name}"),
@@ -548,7 +654,7 @@ impl LiveCli {
 
     fn set_permissions(&mut self, mode: Option<String>) -> Result<(), Box<dyn std::error::Error>> {
         let Some(mode) = mode else {
-            println!("Current permission mode: {}", permission_mode_label());
+            println!("{}", format_permissions_report(permission_mode_label()));
             return Ok(());
         };
 
@@ -559,10 +665,11 @@ impl LiveCli {
         })?;
 
         if normalized == permission_mode_label() {
-            println!("Permission mode already set to {normalized}.");
+            println!("{}", format_permissions_report(normalized));
             return Ok(());
         }
 
+        let previous = permission_mode_label().to_string();
         let session = self.runtime.session().clone();
         self.runtime = build_runtime_with_permission_mode(
             session,
@@ -571,7 +678,10 @@ impl LiveCli {
             true,
             normalized,
         )?;
-        println!("Switched permission mode to {normalized}.");
+        println!(
+            "{}",
+            format_permissions_switch_report(&previous, normalized)
+        );
         Ok(())
     }
 
@@ -590,20 +700,20 @@ impl LiveCli {
             true,
             permission_mode_label(),
         )?;
-        println!("Cleared local session history.");
+        println!(
+            "Session cleared
+  Mode             fresh session
+  Preserved model  {}
+  Permission mode  {}",
+            self.model,
+            permission_mode_label()
+        );
         Ok(())
     }
 
     fn print_cost(&self) {
         let cumulative = self.runtime.usage().cumulative_usage();
-        println!(
-            "cost: input_tokens={} output_tokens={} cache_creation_tokens={} cache_read_tokens={} total_tokens={}",
-            cumulative.input_tokens,
-            cumulative.output_tokens,
-            cumulative.cache_creation_input_tokens,
-            cumulative.cache_read_input_tokens,
-            cumulative.total_tokens(),
-        );
+        println!("{}", format_cost_report(cumulative));
     }
 
     fn resume_session(
@@ -624,12 +734,15 @@ impl LiveCli {
             true,
             permission_mode_label(),
         )?;
-        println!("Resumed session from {session_path} ({message_count} messages).");
+        println!(
+            "{}",
+            format_resume_report(&session_path, message_count, self.runtime.usage().turns())
+        );
         Ok(())
     }
 
-    fn print_config() -> Result<(), Box<dyn std::error::Error>> {
-        println!("{}", render_config_report()?);
+    fn print_config(section: Option<&str>) -> Result<(), Box<dyn std::error::Error>> {
+        println!("{}", render_config_report(section)?);
         Ok(())
     }
 
@@ -646,6 +759,8 @@ impl LiveCli {
     fn compact(&mut self) -> Result<(), Box<dyn std::error::Error>> {
         let result = self.runtime.compact(CompactionConfig::default());
         let removed = result.removed_message_count;
+        let kept = result.compacted_session.messages.len();
+        let skipped = removed == 0;
         self.runtime = build_runtime_with_permission_mode(
             result.compacted_session,
             self.model.clone(),
@@ -653,16 +768,22 @@ impl LiveCli {
             true,
             permission_mode_label(),
         )?;
-        println!("Compacted {removed} messages.");
+        println!("{}", format_compact_report(removed, kept, skipped));
         Ok(())
     }
 }
 
 fn render_repl_help() -> String {
-    format!(
-        "{}
-  /exit                Quit the REPL",
-        render_slash_command_help()
+    [
+        "REPL".to_string(),
+        "  /exit                Quit the REPL".to_string(),
+        "  /quit                Quit the REPL".to_string(),
+        String::new(),
+        render_slash_command_help(),
+    ]
+    .join(
+        "
+",
     )
 }
 
@@ -673,13 +794,17 @@ fn status_context(
     let loader = ConfigLoader::default_for(&cwd);
     let discovered_config_files = loader.discover().len();
     let runtime_config = loader.load()?;
-    let project_context = ProjectContext::discover(&cwd, DEFAULT_DATE)?;
+    let project_context = ProjectContext::discover_with_git(&cwd, DEFAULT_DATE)?;
+    let (project_root, git_branch) =
+        parse_git_status_metadata(project_context.git_status.as_deref());
     Ok(StatusContext {
         cwd,
         session_path: session_path.map(Path::to_path_buf),
         loaded_config_files: runtime_config.loaded_entries().len(),
         discovered_config_files,
         memory_file_count: project_context.instruction_files.len(),
+        project_root,
+        git_branch,
     })
 }
 
@@ -713,10 +838,17 @@ fn format_status_report(
         format!(
             "Workspace
   Cwd              {}
+  Project root     {}
+  Git branch       {}
   Session          {}
   Config files     loaded {}/{}
   Memory files     {}",
             context.cwd.display(),
+            context
+                .project_root
+                .as_ref()
+                .map_or_else(|| "unknown".to_string(), |path| path.display().to_string()),
+            context.git_branch.as_deref().unwrap_or("unknown"),
             context.session_path.as_ref().map_or_else(
                 || "live-repl".to_string(),
                 |path| path.display().to_string()
@@ -733,7 +865,7 @@ fn format_status_report(
     )
 }
 
-fn render_config_report() -> Result<String, Box<dyn std::error::Error>> {
+fn render_config_report(section: Option<&str>) -> Result<String, Box<dyn std::error::Error>> {
     let cwd = env::current_dir()?;
     let loader = ConfigLoader::default_for(&cwd);
     let discovered = loader.discover();
@@ -771,6 +903,36 @@ fn render_config_report() -> Result<String, Box<dyn std::error::Error>> {
             entry.path.display()
         ));
     }
+
+    if let Some(section) = section {
+        lines.push(format!("Merged section: {section}"));
+        let value = match section {
+            "env" => runtime_config.get("env"),
+            "hooks" => runtime_config.get("hooks"),
+            "model" => runtime_config.get("model"),
+            other => {
+                lines.push(format!(
+                    "  Unsupported config section '{other}'. Use env, hooks, or model."
+                ));
+                return Ok(lines.join(
+                    "
+",
+                ));
+            }
+        };
+        lines.push(format!(
+            "  {}",
+            match value {
+                Some(value) => value.render(),
+                None => "<unset>".to_string(),
+            }
+        ));
+        return Ok(lines.join(
+            "
+",
+        ));
+    }
+
     lines.push("Merged JSON".to_string());
     lines.push(format!("  {}", runtime_config.as_json().render()));
     Ok(lines.join(
@@ -780,27 +942,33 @@ fn render_config_report() -> Result<String, Box<dyn std::error::Error>> {
 }
 
 fn render_memory_report() -> Result<String, Box<dyn std::error::Error>> {
-    let project_context = ProjectContext::discover(env::current_dir()?, DEFAULT_DATE)?;
+    let cwd = env::current_dir()?;
+    let project_context = ProjectContext::discover(&cwd, DEFAULT_DATE)?;
     let mut lines = vec![format!(
-        "memory: files={}",
+        "Memory
+  Working directory {}
+  Instruction files {}",
+        cwd.display(),
         project_context.instruction_files.len()
     )];
     if project_context.instruction_files.is_empty() {
+        lines.push("Discovered files".to_string());
         lines.push(
             "  No CLAUDE instruction files discovered in the current directory ancestry."
                 .to_string(),
         );
     } else {
-        for file in project_context.instruction_files {
+        lines.push("Discovered files".to_string());
+        for (index, file) in project_context.instruction_files.iter().enumerate() {
             let preview = file.content.lines().next().unwrap_or("").trim();
             let preview = if preview.is_empty() {
                 "<empty>"
             } else {
                 preview
             };
+            lines.push(format!("  {}. {}", index + 1, file.path.display(),));
             lines.push(format!(
-                "  {} ({}) {}",
-                file.path.display(),
+                "     lines={} preview={}",
                 file.content.lines().count(),
                 preview
             ));
@@ -816,15 +984,12 @@ fn init_claude_md() -> Result<String, Box<dyn std::error::Error>> {
     let cwd = env::current_dir()?;
     let claude_md = cwd.join("CLAUDE.md");
     if claude_md.exists() {
-        return Ok(format!(
-            "init: skipped because {} already exists",
-            claude_md.display()
-        ));
+        return Ok(format_init_report(&claude_md, false));
     }
 
     let content = render_init_claude_md(&cwd);
     fs::write(&claude_md, content)?;
-    Ok(format!("init: created {}", claude_md.display()))
+    Ok(format_init_report(&claude_md, true))
 }
 
 fn render_init_claude_md(cwd: &Path) -> String {
@@ -1234,10 +1399,12 @@ fn print_help() {
 #[cfg(test)]
 mod tests {
     use super::{
-        format_model_report, format_model_switch_report, format_status_report,
-        normalize_permission_mode, parse_args, render_init_claude_md, render_repl_help,
-        resume_supported_slash_commands, status_context, CliAction, SlashCommand, StatusUsage,
-        DEFAULT_MODEL,
+        format_compact_report, format_cost_report, format_init_report, format_model_report,
+        format_model_switch_report, format_permissions_report, format_permissions_switch_report,
+        format_resume_report, format_status_report, normalize_permission_mode, parse_args,
+        parse_git_status_metadata, render_config_report, render_init_claude_md,
+        render_memory_report, render_repl_help, resume_supported_slash_commands, status_context,
+        CliAction, SlashCommand, StatusUsage, DEFAULT_MODEL,
     };
     use runtime::{ContentBlock, ConversationMessage, MessageRole};
     use std::path::{Path, PathBuf};
@@ -1325,8 +1492,16 @@ mod tests {
     }
 
     #[test]
+    fn shared_help_uses_resume_annotation_copy() {
+        let help = commands::render_slash_command_help();
+        assert!(help.contains("Slash commands"));
+        assert!(help.contains("works with --resume SESSION.json"));
+    }
+
+    #[test]
     fn repl_help_includes_shared_commands_and_exit() {
         let help = render_repl_help();
+        assert!(help.contains("REPL"));
         assert!(help.contains("/help"));
         assert!(help.contains("/status"));
         assert!(help.contains("/model [model]"));
@@ -1334,7 +1509,7 @@ mod tests {
         assert!(help.contains("/clear [--confirm]"));
         assert!(help.contains("/cost"));
         assert!(help.contains("/resume <session-path>"));
-        assert!(help.contains("/config"));
+        assert!(help.contains("/config [env|hooks|model]"));
         assert!(help.contains("/memory"));
         assert!(help.contains("/init"));
         assert!(help.contains("/exit"));
@@ -1350,6 +1525,67 @@ mod tests {
             names,
             vec!["help", "status", "compact", "clear", "cost", "config", "memory", "init",]
         );
+    }
+
+    #[test]
+    fn resume_report_uses_sectioned_layout() {
+        let report = format_resume_report("session.json", 14, 6);
+        assert!(report.contains("Session resumed"));
+        assert!(report.contains("Session file     session.json"));
+        assert!(report.contains("Messages         14"));
+        assert!(report.contains("Turns            6"));
+    }
+
+    #[test]
+    fn compact_report_uses_structured_output() {
+        let compacted = format_compact_report(8, 5, false);
+        assert!(compacted.contains("Compact"));
+        assert!(compacted.contains("Result           compacted"));
+        assert!(compacted.contains("Messages removed 8"));
+        let skipped = format_compact_report(0, 3, true);
+        assert!(skipped.contains("Result           skipped"));
+    }
+
+    #[test]
+    fn cost_report_uses_sectioned_layout() {
+        let report = format_cost_report(runtime::TokenUsage {
+            input_tokens: 20,
+            output_tokens: 8,
+            cache_creation_input_tokens: 3,
+            cache_read_input_tokens: 1,
+        });
+        assert!(report.contains("Cost"));
+        assert!(report.contains("Input tokens     20"));
+        assert!(report.contains("Output tokens    8"));
+        assert!(report.contains("Cache create     3"));
+        assert!(report.contains("Cache read       1"));
+        assert!(report.contains("Total tokens     32"));
+    }
+
+    #[test]
+    fn permissions_report_uses_sectioned_layout() {
+        let report = format_permissions_report("workspace-write");
+        assert!(report.contains("Permissions"));
+        assert!(report.contains("Current mode     workspace-write"));
+        assert!(report.contains("Available modes"));
+        assert!(report.contains("danger-full-access"));
+    }
+
+    #[test]
+    fn permissions_switch_report_is_structured() {
+        let report = format_permissions_switch_report("read-only", "workspace-write");
+        assert!(report.contains("Permissions updated"));
+        assert!(report.contains("Previous         read-only"));
+        assert!(report.contains("Current          workspace-write"));
+    }
+
+    #[test]
+    fn init_report_uses_structured_output() {
+        let created = format_init_report(Path::new("/tmp/CLAUDE.md"), true);
+        assert!(created.contains("Init"));
+        assert!(created.contains("Result           created"));
+        let skipped = format_init_report(Path::new("/tmp/CLAUDE.md"), false);
+        assert!(skipped.contains("skipped (already exists)"));
     }
 
     #[test]
@@ -1398,6 +1634,8 @@ mod tests {
                 loaded_config_files: 2,
                 discovered_config_files: 3,
                 memory_file_count: 4,
+                project_root: Some(PathBuf::from("/tmp")),
+                git_branch: Some("main".to_string()),
             },
         );
         assert!(status.contains("Status"));
@@ -1407,17 +1645,44 @@ mod tests {
         assert!(status.contains("Latest total     10"));
         assert!(status.contains("Cumulative total 31"));
         assert!(status.contains("Cwd              /tmp/project"));
+        assert!(status.contains("Project root     /tmp"));
+        assert!(status.contains("Git branch       main"));
         assert!(status.contains("Session          session.json"));
         assert!(status.contains("Config files     loaded 2/3"));
         assert!(status.contains("Memory files     4"));
     }
 
     #[test]
+    fn config_report_supports_section_views() {
+        let report = render_config_report(Some("env")).expect("config report should render");
+        assert!(report.contains("Merged section: env"));
+    }
+
+    #[test]
+    fn memory_report_uses_sectioned_layout() {
+        let report = render_memory_report().expect("memory report should render");
+        assert!(report.contains("Memory"));
+        assert!(report.contains("Working directory"));
+        assert!(report.contains("Instruction files"));
+        assert!(report.contains("Discovered files"));
+    }
+
+    #[test]
     fn config_report_uses_sectioned_layout() {
-        let report = super::render_config_report().expect("config report should render");
+        let report = render_config_report(None).expect("config report should render");
         assert!(report.contains("Config"));
         assert!(report.contains("Discovered files"));
         assert!(report.contains("Merged JSON"));
+    }
+
+    #[test]
+    fn parses_git_status_metadata() {
+        let (root, branch) = parse_git_status_metadata(Some(
+            "## rcc/cli...origin/rcc/cli
+ M src/main.rs",
+        ));
+        assert_eq!(branch.as_deref(), Some("rcc/cli"));
+        let _ = root;
     }
 
     #[test]
@@ -1466,7 +1731,16 @@ mod tests {
             SlashCommand::parse("/clear --confirm"),
             Some(SlashCommand::Clear { confirm: true })
         );
-        assert_eq!(SlashCommand::parse("/config"), Some(SlashCommand::Config));
+        assert_eq!(
+            SlashCommand::parse("/config"),
+            Some(SlashCommand::Config { section: None })
+        );
+        assert_eq!(
+            SlashCommand::parse("/config env"),
+            Some(SlashCommand::Config {
+                section: Some("env".to_string())
+            })
+        );
         assert_eq!(SlashCommand::parse("/memory"), Some(SlashCommand::Memory));
         assert_eq!(SlashCommand::parse("/init"), Some(SlashCommand::Init));
     }
